@@ -26,40 +26,6 @@ def print_output(*args):
 
 class SpectrogramAudioSource(object):
 
-    def _callback(self, indata, frames, time, status):
-
-        global STOP
-        if STOP:
-            raise Exception("Stopped")
-
-        if status:
-            text = ' ' + str(status) + ' '
-            print('\x1b[34;40m', text.center(self.columns, '#'),
-                  '\x1b[0m', sep='')
-        if any(indata):
-
-            self.buffer_queue.put(indata, block=False)
-
-            if self.enable_spectrogram:
-                magnitude = np.abs(np.fft.rfft(indata[:, 0], n=self.fftsize))
-                magnitude *= self.gain / self.fftsize
-                line = (self.gradient[int(np.clip(x, 0, 1) * (len(self.gradient) - 1))]
-                        for x in magnitude[self.low_bin:self.low_bin + self.columns])
-                print(*line, sep='', end='\x1b[0m\n')
-
-            
-            if self.full_buffer_callback is not None and self.buffer_queue.qsize()>30:
-                buff = [] #collections.deque(maxlen=50)
-                for i in range(30):
-                    block = self.buffer_queue.get()
-                    self.buffer_queue.task_done()
-                    buff.append(block)
-                self.full_buffer_callback(np.concatenate(buff))
-               
-        else:
-            print('no input')
-
-
     def __init__(self, 
             device, 
             gain, 
@@ -73,6 +39,7 @@ class SpectrogramAudioSource(object):
             flush_queue=True):
         
         samplerate = 16000
+        self.pending_response = False
         self.device = device
         self.gain = gain
         self.full_buffer_callback = full_buffer_callback
@@ -105,6 +72,42 @@ class SpectrogramAudioSource(object):
         self.block_duration_ms = block_duration_ms
         self.active = False
         self.stream = None
+
+
+    def _callback(self, indata, frames, time, status):
+
+        global STOP
+        if STOP:
+            raise Exception("Stopped")
+
+        if status:
+            text = ' ' + str(status) + ' '
+            print('\x1b[34;40m', text.center(self.columns, '#'),
+                  '\x1b[0m', sep='')
+        if any(indata):
+
+
+            self.buffer_queue.put(indata, block=False) # 'block=False' here means non-blocking, async call
+            
+            if self.enable_spectrogram and not self.pending_response:
+                magnitude = np.abs(np.fft.rfft(indata[:, 0], n=self.fftsize))
+                magnitude *= self.gain / self.fftsize
+                line = (self.gradient[int(np.clip(x, 0, 1) * (len(self.gradient) - 1))]
+                        for x in magnitude[self.low_bin:self.low_bin + self.columns])
+                print(*line, sep='', end='\x1b[0m\n')
+                #print(indata.max())                
+            
+            if self.full_buffer_callback is not None and self.buffer_queue.qsize()>30:
+                buff = [] #collections.deque(maxlen=50)
+                for i in range(30):
+                    block = self.buffer_queue.get()
+                    self.buffer_queue.task_done()
+                    buff.append(block)
+                self.full_buffer_callback(np.concatenate(buff))
+               
+        else:
+            print('no input')
+
 
     def listen(self):
         self.active = True
@@ -165,7 +168,8 @@ class VADAudioSource(SpectrogramAudioSource):
             aggressiveness):
         super().__init__(device, gain, low, high, columns, block_duration_ms, enable_spectrogram)
         self.vad = webrtcvad.Vad(aggressiveness)
-
+        self.triggered = False
+       
     def is_speech(self, numpy_block):
         #print(numpy_block)
         bytes_arr = np.chararray.tostring(numpy_block.astype(np.int16))
@@ -173,7 +177,7 @@ class VADAudioSource(SpectrogramAudioSource):
         is_speech = self.vad.is_speech(bytes_arr, 16000)
         return is_speech
 
-    def vad_collector(self, padding_ms=300, ratio=0.0): #0.75
+    def vad_collector(self, padding_ms=600, ratio=0.75):
         """Generator that yields series of consecutive audio blocks comprising each utterence, separated by yielding a single None.
             Determines voice activity by ratio of blocks in padding_ms. Uses a buffer to include padding_ms prior to being triggered.
             Example: (block, ..., block, None, block, ..., block, None, ...)
@@ -182,17 +186,19 @@ class VADAudioSource(SpectrogramAudioSource):
         
         num_padding_blocks = padding_ms // self.block_duration_ms
         ring_buffer = collections.deque(maxlen=num_padding_blocks)
-        triggered = False
+        self.triggered = False
 
         #... note use of iter(self) - we expect this method to be called in a separete thread 
         for block in iter(self):
             is_speech = self.is_speech(block)
             #print((is_speech,triggered))
-            if not triggered:
+            if not self.triggered:
                 ring_buffer.append((block, is_speech))
                 num_voiced = len([f for f, speech in ring_buffer if speech])
                 if num_voiced > ratio * ring_buffer.maxlen:
-                    triggered = True
+                    self.triggered = True
+                    self.pending_response = True
+                    print_output("Listening..")
                     for f, s in ring_buffer:
                         yield f
                     ring_buffer.clear()
@@ -202,7 +208,7 @@ class VADAudioSource(SpectrogramAudioSource):
                 ring_buffer.append((block, is_speech))
                 num_unvoiced = len([f for f, speech in ring_buffer if not speech])
                 if num_unvoiced > ratio * ring_buffer.maxlen:
-                    triggered = False
+                    self.triggered = False
                     yield None
                     ring_buffer.clear()
 
@@ -239,7 +245,7 @@ def audio_consumer(vad_audio, websocket, enable_spinner=True):
 
 
 websocket_ready = False
-def websocket_runner(websocket):
+def websocket_runner(websocket, vad_audio):
     """blocks"""
 
     def on_event(event):
@@ -249,9 +255,13 @@ def websocket_runner(websocket):
                 print_output("Connected!")
             websocket_ready = True
         elif isinstance(event, events.Text):
-            if 1: print_output("Recognized: %s" % event.text)
+            if 1: 
+                print_output("Recognized: %s" % event.text)
+                vad_audio.pending_response = False
+
         elif 1:
             print_output(event)
+            vad_audio.pending_response = False
             logging.debug(event)
 
     for event in websocket:
@@ -259,6 +269,7 @@ def websocket_runner(websocket):
             on_event(event)
         except:
             logger.exception('error handling %r', event)
+            vad_audio.pending_response = False
             websocket.close()            
 
 def main():
@@ -284,14 +295,14 @@ def main():
                         help='width of spectrogram')
     parser.add_argument('-d', '--device', type=int_or_str,
                         help='input device (numeric ID or substring)')
-    parser.add_argument('-g', '--gain', type=float, default=0.05,
+    parser.add_argument('-g', '--gain', type=float, default=0.01,
                         help='initial gain factor (default %(default)s)')
     parser.add_argument('-r', '--range', type=float, nargs=2,
                         metavar=('LOW', 'HIGH'), default=[100, 2000],
                         help='frequency range (default %(default)s Hz)')
     parser.add_argument('-s', '--server', default='ws://0.0.0.0:5000/recognize',
         help="Default: ws://0.0.0.0:5000/recognize")
-    parser.add_argument('--enable-spectrogram', action='store_true')
+    parser.add_argument('--enable-spectrogram', default=True, action='store_true')
     parser.add_argument('-a', '--aggressiveness', type=int, default=3,
             help="Set aggressiveness of VAD: an integer between 0 and 3, 0 being the least aggressive about filtering out non-speech, 3 the most aggressive. Default: 3")
 
@@ -316,7 +327,7 @@ def main():
 
     #vad_audio = VADAudio(aggressiveness=ARGS.aggressiveness)
     print_output("Enabling Voice Detection ...")
-    audio_consumer_thread = threading.Thread(target=lambda: audio_consumer(vad_audio, websocket, enable_spinner=not enable_spectrogram))
+    audio_consumer_thread = threading.Thread(target=lambda: audio_consumer(vad_audio, websocket))
     audio_consumer_thread.start()
 
     print_output("Listening for audio...")
@@ -326,7 +337,7 @@ def main():
     print_output("(ctrl-C to exit)")
     print_output("")
 
-    websocket_runner(websocket)
+    websocket_runner(websocket, vad_audio)
 
 if __name__ == "__main__":
     main()
