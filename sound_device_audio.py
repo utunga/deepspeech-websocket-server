@@ -300,9 +300,9 @@ def main():
     parser.add_argument('-r', '--range', type=float, nargs=2,
                         metavar=('LOW', 'HIGH'), default=[100, 2000],
                         help='frequency range (default %(default)s Hz)')
-    parser.add_argument('-s', '--server', default='ws://0.0.0.0:5000/recognize',
-        help="Default: ws://0.0.0.0:5000/recognize")
-    parser.add_argument('--enable-spectrogram', default=True, action='store_true')
+    parser.add_argument('-s', '--server', default='ws://0.0.0.0:5000/stt',
+        help="Default: ws://0.0.0.0:5000/stt")
+    parser.add_argument('--enable-spectrogram', action='store_true')
     parser.add_argument('-a', '--aggressiveness', type=int, default=3,
             help="Set aggressiveness of VAD: an integer between 0 and 3, 0 being the least aggressive about filtering out non-speech, 3 the most aggressive. Default: 3")
 
